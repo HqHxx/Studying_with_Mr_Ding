@@ -1,0 +1,7 @@
+# ── 核心运行时依赖 ──────────────────────────────
+customtkinter>=5.2.0
+openai>=1.0.0
+fpdf2>=2.7.9
+fonttools>=4.50.0
+ebooklib>=0.18
+markdown>=3.5

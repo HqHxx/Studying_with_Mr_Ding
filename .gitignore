@@ -1,0 +1,9 @@
+.venv/
+venv/
+__pycache__/
+dist/
+build/
+*.spec
+*.exe
+*.db
+.api_config.json
