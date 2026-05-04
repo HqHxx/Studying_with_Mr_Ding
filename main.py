@@ -19,7 +19,7 @@ import customtkinter as ctk
 from PIL import Image
 import os
 
-from content_engine import ContentEngine
+from content_engine import ContentEngine, save_used_articles
 from db_manager import DBManager
 from pdf_generator import export_to_pdf
 from app_paths import BASE_DIR, INTERNAL_DIR
@@ -196,8 +196,12 @@ class App(ctk.CTk):
     def _build_tab_generate(self) -> None:
         tab = self.tab_generate
 
+        # ── 顶部容器（支持自然压缩） ──
+        self.top_container = ctk.CTkFrame(tab, fg_color="transparent")
+        self.top_container.pack(side="top", fill="both", expand=True)
+
         # ── API 配置区域 ──────────────────────────────────────
-        self.api_frame = ctk.CTkFrame(tab, corner_radius=10)
+        self.api_frame = ctk.CTkFrame(self.top_container, corner_radius=10)
         self.api_frame.pack(fill="x", padx=16, pady=(12, 8))
         self.api_frame.grid_columnconfigure(1, weight=1)
         self.api_frame.grid_columnconfigure(3, weight=1)
@@ -266,7 +270,7 @@ class App(ctk.CTk):
             command=self._on_save_profile,
         ).grid(row=4, column=4, padx=(5, 14), pady=(8, 14), sticky="e")
         # ── 生成控制区 ────────────────────────────────────────
-        self.ctrl_frame = ctk.CTkFrame(tab, corner_radius=10)
+        self.ctrl_frame = ctk.CTkFrame(self.top_container, corner_radius=10)
         self.ctrl_frame.pack(fill="x", padx=16, pady=8)
         self.ctrl_frame.grid_columnconfigure(0, weight=1)
 
@@ -274,13 +278,20 @@ class App(ctk.CTk):
             self.ctrl_frame, text="📝  生成设置", font=self.FONT_TITLE,
         ).grid(row=0, column=0, columnspan=6, sticky="w", padx=14, pady=(12, 10))
 
-        # 模式切换
+        # 模式切换与批量导入
         mode_frame = ctk.CTkFrame(self.ctrl_frame, fg_color="transparent")
         mode_frame.grid(row=1, column=0, columnspan=6, sticky="w", padx=14, pady=(0, 6))
         
-        self.source_mode_var = ctk.StringVar(value="random")
-        ctk.CTkRadioButton(mode_frame, text="随机题库抽取", font=self.FONT_UI, variable=self.source_mode_var, value="random", command=self._on_source_mode_changed).pack(side="left", padx=(0, 30))
-        ctk.CTkRadioButton(mode_frame, text="自定义文章", font=self.FONT_UI, variable=self.source_mode_var, value="custom", command=self._on_source_mode_changed).pack(side="left")
+        ctk.CTkLabel(mode_frame, text="语料来源:", font=self.FONT_UI).pack(side="left", padx=(0, 10))
+        
+        self.source_mode_var = ctk.StringVar(value="builtin")
+        ctk.CTkRadioButton(mode_frame, text="内置系统语料", font=self.FONT_UI, variable=self.source_mode_var, value="builtin").pack(side="left", padx=(0, 20))
+        ctk.CTkRadioButton(mode_frame, text="仅自定义语料", font=self.FONT_UI, variable=self.source_mode_var, value="custom").pack(side="left", padx=(0, 20))
+        ctk.CTkRadioButton(mode_frame, text="混合抽取", font=self.FONT_UI, variable=self.source_mode_var, value="mixed").pack(side="left", padx=(0, 30))
+        
+        # 批量导入按钮与帮助
+        ctk.CTkButton(mode_frame, text="📁 批量导入本地文件", font=self.FONT_UI, width=140, fg_color="#3498db", hover_color="#2980b9", command=self._on_import_custom_corpus).pack(side="left", padx=(10, 5))
+        ctk.CTkButton(mode_frame, text="[?]", font=self.FONT_UI, width=28, command=self._on_show_import_help).pack(side="left")
 
         # 随机抽取参数区
         self.random_param_frame = ctk.CTkFrame(self.ctrl_frame, fg_color="transparent")
@@ -316,17 +327,9 @@ class App(ctk.CTk):
         self.combo_category.grid(row=0, column=5, sticky="w", padx=(4, 14), pady=8)
         self.combo_category.set("history")
 
-        # 自定义文章输入区
-        self.custom_text_frame = ctk.CTkFrame(self.ctrl_frame, fg_color="transparent")
-        self.custom_text_frame.grid(row=3, column=0, columnspan=6, sticky="nsew", padx=14, pady=(0, 14))
-        self.custom_text_frame.grid_remove() # 默认隐藏
-        
-        ctk.CTkLabel(self.custom_text_frame, text="请在此输入您的英文原文 (800 - 5000 字符):", text_color="gray", font=self.FONT_UI).pack(anchor="w", pady=(0, 6))
-        self.custom_textbox = ctk.CTkTextbox(self.custom_text_frame, height=220, wrap="word", font=self.FONT_TEXT)
-        self.custom_textbox.pack(fill="both", expand=True)
 
         # ── 按钮区域（开始 + 停止） ──────────────────────────
-        self.btn_frame = ctk.CTkFrame(tab, fg_color="transparent")
+        self.btn_frame = ctk.CTkFrame(self.top_container, fg_color="transparent")
         self.btn_frame.pack(fill="x", padx=16, pady=(8, 6))
 
         self.btn_start = ctk.CTkButton(
@@ -353,7 +356,7 @@ class App(ctk.CTk):
         self.btn_stop.pack(side="right", ipadx=16)
 
         # ── 重置进度区域 ──────────────────────────────────────
-        self.reset_frame = ctk.CTkFrame(tab, corner_radius=10)
+        self.reset_frame = ctk.CTkFrame(self.top_container, corner_radius=10)
         self.reset_frame.pack(fill="x", padx=16, pady=(4, 8))
 
         ctk.CTkLabel(
@@ -396,16 +399,31 @@ class App(ctk.CTk):
         )
         self.btn_reset_all.pack(side="left")
 
-        # ── 日志输出 ──────────────────────────────────────────
+        # ── 日志输出（先 pack，沉在最底） ──────────────────────
         self.log_textbox = ctk.CTkTextbox(
             tab,
             font=self.FONT_TEXT,
             corner_radius=10,
             state="disabled",
             wrap="word",
+            height=150
         )
-        self.log_textbox.pack(fill="both", expand=True, padx=16, pady=(4, 12))
-        self._log("就绪。请配置 API 参数后点击「开始生成」。")
+        self.log_textbox.pack(side="bottom", fill="x", padx=16, pady=(0, 12))
+
+        self.log_textbox.tag_config("red", foreground="#ff4757")
+        self.log_textbox.tag_config("green", foreground="#2ed573")
+        self.log_textbox.tag_config("white", foreground="white")
+
+        # ── 可拖拽分割线（后 pack，叠在日志框上方） ────────────
+        self.sash = ctk.CTkFrame(tab, height=5, corner_radius=2, fg_color="gray30", cursor="sb_v_double_arrow")
+        self.sash.pack(side="bottom", fill="x", padx=60, pady=(4, 4))
+        self.sash.bind("<B1-Motion>", self._on_sash_drag)
+        self.sash.bind("<Button-1>", self._on_sash_press)
+
+        self.sash.bind("<Enter>", lambda e: self.sash.configure(fg_color="#3498db"))
+        self.sash.bind("<Leave>", lambda e: self.sash.configure(fg_color="gray30"))
+
+        self.log_message("就绪。请配置 API 参数后点击「开始生成」。", level="info")
 
     # ── Tab 2: 历史归档阅读 ───────────────────────────────────
     def _build_tab_archive(self) -> None:
@@ -420,20 +438,24 @@ class App(ctk.CTk):
             row=0, column=0, padx=(0, 8), pady=8
         )
 
-        self.archive_combo = ctk.CTkComboBox(
-            bar, values=["（点击刷新加载）"], state="readonly", font=self.FONT_UI,
+        # ── 文件名显示 + 选择按钮 ────────────────────────────
+        self.archive_display = ctk.CTkEntry(
+            bar, font=self.FONT_UI, state="readonly", width=400
         )
-        self.archive_combo.grid(row=0, column=1, sticky="ew", padx=(0, 10), pady=8)
-        self.archive_combo.set("（点击刷新加载）")
+        self.archive_display.grid(row=0, column=1, sticky="ew", padx=(0, 10), pady=8)
+        self.archive_display.configure(state="normal")
+        self.archive_display.insert(0, "（点击右侧按钮选择）")
+        self.archive_display.configure(state="readonly")
+
+        self.btn_select_archive = ctk.CTkButton(
+            bar, text="📂 选择归档 ▼", width=120, font=self.FONT_UI,
+            command=self._open_file_selector,
+        )
+        self.btn_select_archive.grid(row=0, column=2, padx=5, pady=8)
 
         btn_w = 100
         ctk.CTkButton(
-            bar, text="🔄  刷新", width=btn_w, font=self.FONT_UI,
-            command=self._on_refresh_archives,
-        ).grid(row=0, column=2, padx=5, pady=8)
-
-        ctk.CTkButton(
-            bar, text="🔍  预览", width=btn_w, font=self.FONT_UI,
+            bar, text="  预览", width=btn_w, font=self.FONT_UI,
             command=self._on_preview_archive,
         ).grid(row=0, column=3, padx=5, pady=8)
 
@@ -466,21 +488,105 @@ class App(ctk.CTk):
         self.preview_textbox.insert("1.0", "\n\n\n\n\t\t\t\t👈 请在上方选择一份历史特刊进行预览...")
         self.preview_textbox.configure(state="disabled")
 
-        # 初始加载归档列表
-        self._on_refresh_archives()
+        # 初始加载归档列表（静默更新内部缓存，不弹窗）
+        self._refresh_archive_cache()
+
+
+    # ── 分割线与导入功能 ──────────────────────────────────────
+    def _on_sash_press(self, event) -> None:
+        self._sash_start_y = event.y_root
+        self._log_start_height = self.log_textbox.winfo_height()
+
+    def _on_sash_drag(self, event) -> None:
+        dy = self._sash_start_y - event.y_root  # 向上拖动为正值
+        new_height = self._log_start_height + dy
+        max_height = self.winfo_height() / 2.5
+        if new_height < 60: new_height = 60
+        if new_height > max_height: new_height = max_height
+        self.log_textbox.configure(height=int(new_height))
+
+    def _on_show_import_help(self) -> None:
+        top = ctk.CTkToplevel(self)
+        top.title("📖 语料导入标准说明")
+        top.geometry("450x260")
+        top.attributes("-topmost", True)
+        
+        msg = (
+            "【批量导入本地文件规则】\n\n"
+            "1. 支持的格式：仅限 .txt 和 .md 纯文本文件。\n\n"
+            "2. 编码建议：强烈推荐使用 UTF-8 编码，\n"
+            "   若文件存在特殊字符导致解析失败将自动跳过。\n\n"
+            "3. 解析规则：系统会自动以“文件名”（去后缀）\n"
+            "   作为文章标题，请尽量保持文件名简洁，\n"
+            "   文件内容将作为正文导入自定义语料库。\n\n"
+            "导入的数据保存在 data/custom_corpus.json 中，\n"
+            "不会影响自带的 local_corpus.json。"
+        )
+        lbl = ctk.CTkLabel(top, text=msg, font=self.FONT_TEXT, justify="left", wraplength=400)
+        lbl.pack(padx=20, pady=20, expand=True, fill="both")
+
+    def _on_import_custom_corpus(self) -> None:
+        from tkinter import filedialog
+        import json
+        file_paths = filedialog.askopenfilenames(
+            title="选择文本或Markdown文件",
+            filetypes=[("Text Files", "*.txt"), ("Markdown", "*.md"), ("All Files", "*.*")]
+        )
+        if not file_paths:
+            return
+            
+        success_count = 0
+        skip_count = 0
+        
+        custom_db_path = BASE_DIR / "data" / "custom_corpus.json"
+        
+        # 加载已有
+        existing_data = []
+        if custom_db_path.exists():
+            try:
+                existing_data = json.loads(custom_db_path.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+                
+        for fp in file_paths:
+            p = Path(fp)
+            if p.suffix.lower() not in [".txt", ".md"]:
+                skip_count += 1
+                continue
+                
+            content = ""
+            try:
+                content = p.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                try:
+                    content = p.read_text(encoding="gbk")
+                except Exception:
+                    self.log_message(f"跳过文件 {p.name}: 编码无法识别", level="error")
+                    skip_count += 1
+                    continue
+            
+            content = content.strip()
+            if not content:
+                skip_count += 1
+                continue
+                
+            existing_data.append({
+                "title": p.stem,
+                "content": content,
+                "category": "custom"
+            })
+            success_count += 1
+            
+        if success_count > 0:
+            custom_db_path.parent.mkdir(parents=True, exist_ok=True)
+            custom_db_path.write_text(json.dumps(existing_data, ensure_ascii=False, indent=2), encoding="utf-8")
+            self.log_message(f"导入成功: {success_count} 篇文章已添加到自定义语料库。", level="success")
+        if skip_count > 0:
+            self.log_message(f"跳过了 {skip_count} 个不符合要求的文件。", level="error")
 
     # ══════════════════════════════════════════════════════════
     #  回调方法
     # ══════════════════════════════════════════════════════════
-    def _on_source_mode_changed(self):
-        """处理来源模式切换"""
-        if self.source_mode_var.get() == "random":
-            self.custom_text_frame.grid_remove()
-            self.random_param_frame.grid()
-        else:
-            self.random_param_frame.grid_remove()
-            self.custom_text_frame.grid()
-
     def _on_profile_selected(self, choice: str) -> None:
         profiles = self._api_config.get("profiles", {})
         if choice in profiles:
@@ -551,72 +657,71 @@ class App(ctk.CTk):
     # ── 开始生成 ────────────────────────────────────────────────────────────
     def _on_start_generate(self) -> None:
         """校验参数并启动后台生成线程。"""
-        base_url = self.entry_base_url.get().strip()
-        fast_model = self.entry_fast_model.get().strip()
-        core_model = self.entry_core_model.get().strip()
-        api_key = self.entry_api_key.get().strip()
-
-        if not base_url or not fast_model or not core_model or not api_key:
-            self._log("⚠️ 请先填写完整的 API 配置（Base URL、Fast Model、Core Model、API Key）。")
-            return
-
-        mode = self.source_mode_var.get()
-        custom_text = ""
-        count = 1
-        level = self.combo_level.get()
-        category = self.combo_category.get()
-
-        if mode == "random":
-            count_str = self.count_var.get().strip()
+        try:
             try:
-                count = int(count_str)
-                if count < 1:
-                    raise ValueError
-            except ValueError:
-                self._log("⚠️ 生成篇数必须为正整数。")
-                return
+                base_url = self.entry_base_url.get().strip()
+                fast_model = self.entry_fast_model.get().strip()
+                core_model = self.entry_core_model.get().strip()
+                api_key = self.entry_api_key.get().strip()
 
-            if not LOCAL_CORPUS_PATH.exists():
-                self._log("⚠️ 未找到 local_corpus.json，请先运行 init_corpus.py 生成测试语料库。")
-                return
-        else:
-            custom_text = self.custom_textbox.get("1.0", "end-1c").strip()
-            text_len = len(custom_text)
-            if text_len < 800 or text_len > 5000:
-                self._log(f"⚠️ 无法提交：字数不符！当前字数: {text_len}，请限制在 800-5000 字符之间。")
-                import tkinter.messagebox
-                tkinter.messagebox.showwarning("字数警告", f"当前字数: {text_len}\n\n请限制在 800 - 5000 字符之间。")
-                return
+                if not base_url or not fast_model or not core_model or not api_key:
+                    self._log("⚠️ 请先填写完整的 API 配置（Base URL、Fast Model、Core Model、API Key）。", level="red")
+                    return
+
+                mode = self.source_mode_var.get()
+                level = self.combo_level.get()
+                category = self.combo_category.get()
                 
-            import re
-            if re.search(r'[\u4e00-\u9fa5]', custom_text):
-                self._log(f"⚠️ 无法提交：检测到中文字符。请提交纯英文版原文。")
-                import tkinter.messagebox
-                tkinter.messagebox.showerror("语言错误", "无法提交，检测到中文字符。\n\n请提交纯英文版原文。")
-                return
+                try:
+                    count = int(self.count_var.get().strip())
+                    if count < 1: raise ValueError
+                except ValueError:
+                    self._log("⚠️ 生成篇数必须为正整数。", level="red")
+                    return
 
-        # 切换按钮状态
-        self._set_running(True)
-        self._stop_flag.clear()
-        self.current_task_id = str(time.time())
-        task_id = self.current_task_id
+                import pathlib
+                LOCAL_CORPUS_PATH = pathlib.Path("local_corpus.json")
+                CUSTOM_CORPUS_PATH = pathlib.Path("custom_corpus.json")
 
-        self._log("━" * 50)
-        if mode == "random":
-            self._log(f"🚀 批量生成任务启动  |  目标: {count} 篇  |  {level} / {category}")
-        else:
-            self._log(f"🚀 自定义文章生成启动  |  原文长度: {len(custom_text)} 字符  |  目标词库: {level}")
-        self._log(f"   Base URL   : {base_url}")
-        self._log(f"   Fast Model : {fast_model}")
-        self._log(f"   Core Model : {core_model}")
+                if mode in ("builtin", "mixed") and not LOCAL_CORPUS_PATH.exists():
+                    self._log("⚠️ 未找到 local_corpus.json，请先运行工具生成测试语料库。", level="red")
+                    if mode == "builtin": return
 
-        # 启动后台线程
-        self._worker_thread = threading.Thread(
-            target=self._batch_generate_worker,
-            args=(base_url, fast_model, core_model, api_key, count, level, category, task_id, mode, custom_text),
-            daemon=True,
-        )
-        self._worker_thread.start()
+                if mode in ("custom", "mixed") and not CUSTOM_CORPUS_PATH.exists():
+                    self._log("⚠️ 未找到 custom_corpus.json，请先批量导入自定义语料。", level="red")
+                    if mode == "custom": return
+
+                self._set_running(True)
+                self._stop_flag.clear()
+                
+                import time
+                self.current_task_id = str(time.time())
+                task_id = self.current_task_id
+
+                self._log("━" * 50)
+                self._log(f"🚀 生成任务启动  |  来源模式: {mode}  |  目标: {count} 篇  |  {level} / {category}")
+                self._log(f"   Base URL   : {base_url}")
+                self._log(f"   Fast Model : {fast_model}")
+                self._log(f"   Core Model : {core_model}")
+
+                import threading
+                self._worker_thread = threading.Thread(
+                    target=self._batch_generate_worker,
+                    args=(base_url, fast_model, core_model, api_key, count, level, category, task_id, mode),
+                    daemon=True,
+                )
+                self._worker_thread.start()
+            except Exception as inner_e:
+                self._log(f"[UI 错误] 无法启动生成任务: {str(inner_e)}", level="red")
+                raise
+        except Exception as e:
+            try:
+                self._log(f"[UI 致命错误] {str(e)}", level="red")
+            except Exception as log_fail:
+                print(f"[致命错误] 日志输出也失败了: {log_fail}")
+                print(f"[原始错误] {e}")
+                import traceback
+                traceback.print_exc()
 
     # ── 停止生成 ──────────────────────────────────────────────
     def _on_stop_generate(self) -> None:
@@ -634,7 +739,7 @@ class App(ctk.CTk):
     # ══════════════════════════════════════════════════════════
     def _batch_generate_worker(
         self, base_url: str, fast_model: str, core_model: str, api_key: str, count: int,
-        level: str, category: str, task_id: str, mode: str = "random", custom_text: str = ""
+        level: str, category: str, task_id: str, mode: str = "builtin"
     ) -> None:
         """在独立线程中运行的批量生成循环。所有 UI 操作通过 after() 调度。"""
         def is_orphaned() -> bool:
@@ -653,6 +758,7 @@ class App(ctk.CTk):
                 base_url=base_url,
                 fast_model=fast_model,
                 core_model=core_model,
+                corpus_mode=mode,
             )
             task_safe_log(f"📚 本地语料库已加载，共 {len(engine.corpus)} 篇素材")
             task_safe_log(f"   词库级别: {level}  |  文章分类: {category}")
@@ -685,7 +791,7 @@ class App(ctk.CTk):
                         words_pool, category=category, level=level,
                         log_callback=task_safe_log,
                         check_stop_callback=is_orphaned,
-                        mode=mode, custom_text=custom_text
+                        
                     )
                 except InterruptedError as ie:
                     if is_orphaned(): return
@@ -700,6 +806,11 @@ class App(ctk.CTk):
                 if not article or str(article).startswith("Error") or not used_words:
                     if is_orphaned(): return
                     failed_count += 1
+                    # 如果翻译失败，释放已占用的语料文章，下次可重新使用
+                    if title and hasattr(engine, '_used_titles') and title in engine._used_titles:
+                        engine._used_titles.discard(title)
+                        save_used_articles(engine._used_titles)
+                        task_safe_log(f"   🔄 已释放语料文章 [{title}]，下次可重新使用。")
                     task_safe_log(f"   ❌ 返回内容无效，已跳过（不扣词）。")
                     if article:
                         task_safe_log(f"      原因: {article[:120]}")
@@ -879,30 +990,85 @@ class App(ctk.CTk):
     # ══════════════════════════════════════════════════════════
     #  归档 Tab 回调
     # ══════════════════════════════════════════════════════════
-    def _on_refresh_archives(self) -> None:
-        """刷新归档目录下的 Markdown 文件列表。"""
+    def _refresh_archive_cache(self) -> list[str]:
+        """刷新归档文件缓存，返回按时间倒序的文件名列表。"""
         md_dir = MARKDOWN_ARCHIVE_DIR
         if not md_dir.is_dir():
-            self.archive_combo.configure(values=["（暂无归档）"])
-            self.archive_combo.set("（暂无归档）")
-            return
-
-        md_files = sorted(
+            return []
+        return sorted(
             [f.name for f in md_dir.iterdir() if f.suffix.lower() == ".md"],
             key=lambda name: os.path.getmtime(md_dir / name),
             reverse=True,
         )
 
+    def _open_file_selector(self) -> None:
+        """弹出模态窗口，使用 CTkScrollableFrame 展示归档列表供选择。"""
+        md_files = self._refresh_archive_cache()
+
+        # ── 创建模态弹窗 ────────────────────────────────────
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("请选择历史归档")
+        dialog.geometry("700x500")
+        dialog.transient(self)
+        dialog.grab_set()
+        dialog.lift()
+
+        # 居中显示
+        dialog.update_idletasks()
+        x = (dialog.winfo_screenwidth() - dialog.winfo_width()) // 2
+        y = (dialog.winfo_screenheight() - dialog.winfo_height()) // 2
+        dialog.geometry(f"+{x}+{y}")
+
+        # ── 标题栏 ──────────────────────────────────────────
+        ctk.CTkLabel(
+            dialog, text=f"📂 历史归档（共 {len(md_files)} 篇）",
+            font=self.FONT_HEADING,
+        ).pack(pady=(16, 8))
+
         if not md_files:
-            self.archive_combo.configure(values=["（暂无归档）"])
-            self.archive_combo.set("（暂无归档）")
-        else:
-            self.archive_combo.configure(values=md_files)
-            self.archive_combo.set(md_files[0])
+            ctk.CTkLabel(
+                dialog, text="暂无归档文件", font=self.FONT_UI,
+                text_color="gray60",
+            ).pack(expand=True)
+            ctk.CTkButton(
+                dialog, text="关闭", width=100, command=dialog.destroy,
+            ).pack(pady=16)
+            return
+
+        # ── 可滚动列表区域 ──────────────────────────────────
+        scroll_frame = ctk.CTkScrollableFrame(dialog, fg_color="transparent")
+        scroll_frame.pack(fill="both", expand=True, padx=20, pady=(0, 8))
+
+        for fname in md_files:
+            btn = ctk.CTkButton(
+                scroll_frame,
+                text=f"  {fname}",
+                font=self.FONT_UI,
+                fg_color="transparent",
+                hover_color="gray30",
+                anchor="w",
+                height=32,
+                corner_radius=4,
+                command=lambda f=fname: self._on_select_archive(f, dialog),
+            )
+            btn.pack(fill="x", pady=(0, 2))
+
+        # ── 底部关闭按钮 ────────────────────────────────────
+        ctk.CTkButton(
+            dialog, text="取消", width=100, command=dialog.destroy,
+        ).pack(pady=(0, 16))
+
+    def _on_select_archive(self, filename: str, dialog: ctk.CTkToplevel) -> None:
+        """用户从弹窗中选择了一个文件。"""
+        self.archive_display.configure(state="normal")
+        self.archive_display.delete(0, "end")
+        self.archive_display.insert(0, filename)
+        self.archive_display.configure(state="readonly")
+        dialog.destroy()
 
     def _on_preview_archive(self) -> None:
         """加载选中的归档文件内容到预览文本框。"""
-        selected = self.archive_combo.get()
+        selected = self.archive_display.get()
         if not selected or selected.startswith("（"):
             self._set_preview("请先选择一个归档文件。")
             return
@@ -1026,16 +1192,36 @@ class App(ctk.CTk):
     # ══════════════════════════════════════════════════════════
     #  辅助方法
     # ══════════════════════════════════════════════════════════
-    def _log(self, message: str) -> None:
-        """向日志面板追加一行（仅限主线程调用）。"""
+    def log_message(self, message: str, level: str = "info") -> None:
+        """向日志面板追加一行（仅限主线程调用）。支持 level: "info", "success", "error" """
         self.log_textbox.configure(state="normal")
+        
+        current_index = self.log_textbox.index("end-1c")
         self.log_textbox.insert("end", message + "\n")
+        new_index = self.log_textbox.index("end")
+        
+        color_map = {"info": "white", "success": "green", "error": "red"}
+        tag = color_map.get(level, "white")
+        self.log_textbox.tag_add(tag, current_index, new_index)
+            
         self.log_textbox.see("end")
         self.log_textbox.configure(state="disabled")
 
-    def _safe_log(self, message: str) -> None:
+    def _log(self, message: str, level: str = "info") -> None:
+        """兼容老代码的直接调用"""
+        if ("❌" in message or "💥" in message or "⚠️" in message) and level == "info":
+            level = "error"
+        if ("✅" in message or "🎉" in message) and level == "info":
+            level = "success"
+        self.log_message(message, level)
+
+    def _safe_log(self, message: str, level: str = "info") -> None:
         """线程安全的日志写入：通过 after() 调度到主线程执行。"""
-        self.after(0, self._log, message)
+        if ("❌" in message or "💥" in message or "⚠️" in message) and level == "info":
+            level = "error"
+        if ("✅" in message or "🎉" in message) and level == "info":
+            level = "success"
+        self.after(0, self.log_message, message, level)
 
     def _set_preview(self, text: str) -> None:
         """设置预览文本框的内容，简易渲染 Markdown 标记。"""
@@ -1080,14 +1266,18 @@ class App(ctk.CTk):
             
             # 重新显示配置框
             if hasattr(self, 'api_frame') and hasattr(self, 'ctrl_frame') and hasattr(self, 'btn_frame') and hasattr(self, 'log_textbox'):
-                # 重新按正确的顺序打包回去
+                # 重新按正确的顺序打包回去：必须先 log_textbox，再 sash
                 self.btn_frame.pack_forget()
+                if hasattr(self, 'sash'):
+                    self.sash.pack_forget()
                 self.log_textbox.pack_forget()
-                
+
                 self.api_frame.pack(fill="x", padx=16, pady=(12, 8))
                 self.ctrl_frame.pack(fill="x", padx=16, pady=8)
                 self.btn_frame.pack(fill="x", padx=16, pady=(8, 6))
-                self.log_textbox.pack(fill="both", expand=True, padx=16, pady=(4, 12))
+                self.log_textbox.pack(side="bottom", fill="x", padx=16, pady=(0, 12))
+                if hasattr(self, 'sash'):
+                    self.sash.pack(side="bottom", fill="x", padx=60, pady=(4, 4))
 
     def _on_level_changed(self, choice: str) -> None:
         """当用户在下拉框切换难度时，实时刷新右上角的进度显示。"""

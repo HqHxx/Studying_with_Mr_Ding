@@ -12,15 +12,34 @@ from openai import OpenAI
 from app_paths import BASE_DIR, INTERNAL_DIR
 
 LOCAL_CORPUS_PATH = INTERNAL_DIR / "local_corpus.json"
+CUSTOM_CORPUS_PATH = BASE_DIR / "data" / "custom_corpus.json"
 USED_ARTICLES_PATH = BASE_DIR / "used_articles.json"
 
 
 # ── 语料库加载 ─────────────────────────────────────────────────
-def load_corpus() -> list[dict]:
-    if not LOCAL_CORPUS_PATH.exists():
-        raise FileNotFoundError(f"本地语料库文件不存在: {LOCAL_CORPUS_PATH}")
-    data = json.loads(LOCAL_CORPUS_PATH.read_text(encoding="utf-8"))
-    return data
+def load_corpus(mode: str = "builtin") -> list[dict]:
+    corpus = []
+    
+    if mode in ["builtin", "mixed"]:
+        if LOCAL_CORPUS_PATH.exists():
+            try:
+                data = json.loads(LOCAL_CORPUS_PATH.read_text(encoding="utf-8"))
+                corpus.extend(data)
+            except Exception as e:
+                print(f"解析内置语料库失败: {e}")
+                
+    if mode in ["custom", "mixed"]:
+        if CUSTOM_CORPUS_PATH.exists():
+            try:
+                data = json.loads(CUSTOM_CORPUS_PATH.read_text(encoding="utf-8"))
+                corpus.extend(data)
+            except Exception as e:
+                print(f"解析自定义语料库失败: {e}")
+                
+    if not corpus:
+        raise FileNotFoundError(f"根据所选模式[{mode}]，最终加载的语料库为空！")
+        
+    return corpus
 
 def load_used_articles() -> set[str]:
     if not USED_ARTICLES_PATH.exists():
@@ -39,11 +58,11 @@ def save_used_articles(titles: set[str]) -> None:
 
 
 class ContentEngine:
-    def __init__(self, api_key: str, base_url: str, fast_model: str, core_model: str) -> None:
+    def __init__(self, api_key: str, base_url: str, fast_model: str, core_model: str, corpus_mode: str = "builtin") -> None:
         self.fast_model = fast_model
         self.core_model = core_model
         self.llm_client = OpenAI(base_url=base_url, api_key=api_key)
-        self.corpus = load_corpus()
+        self.corpus = load_corpus(mode=corpus_mode)
         self._used_titles: set[str] = load_used_articles()
 
     def pick_source_article(self, category: str | None = None) -> dict | None:
@@ -136,26 +155,51 @@ class ContentEngine:
             
         return full_content
 
-    def generate_article(self, words_data: list[dict], category: str = "history", level: str = "CET-4", log_callback=None, check_stop_callback=None, mode: str = "random", custom_text: str = ""):
+    def _validate_translation(self, translated: str, original: str) -> bool:
+        """验证翻译结果是否包含足够的英文段落。
+        
+        检查逻辑：
+        1. 翻译结果不能为空
+        2. 必须包含英文单词（ASCII字母）
+        3. 英文段落数量应不少于原文段落数量的 50%
+        """
+        if not translated or not translated.strip():
+            return False
+        
+        # 检查是否包含英文单词（至少有一些ASCII字母）
+        english_words = re.findall(r'[a-zA-Z]{3,}', translated)
+        if len(english_words) < 10:
+            return False
+        
+        # 统计原文段落数（按空行分割）
+        original_paragraphs = [p.strip() for p in original.split('\n\n') if p.strip()]
+        # 统计翻译结果中的英文段落数（包含至少3个英文单词的段落）
+        translated_paragraphs = [p.strip() for p in translated.split('\n\n') if p.strip()]
+        english_paragraphs = [
+            p for p in translated_paragraphs 
+            if len(re.findall(r'[a-zA-Z]{3,}', p)) >= 3
+        ]
+        
+        # 英文段落数应不少于原文段落数的 30%（允许一些合并/分割差异）
+        min_required = max(2, len(original_paragraphs) * 0.3)
+        return len(english_paragraphs) >= min_required
+
+    def generate_article(self, words_data: list[dict], category: str = "history", level: str = "CET-4", log_callback=None, check_stop_callback=None):
         def _log(msg: str):
             if log_callback:
                 log_callback(msg)
             else:
                 print(msg)
 
-        if mode == "custom":
-            title = "Custom_Article"
-            source_text = custom_text
-        else:
-            source = self.pick_source_article(category=category)
-            if not source:
-                return f"Error: [{category}] 分类下没有可用的未使用文章。", None, None
+        source = self.pick_source_article(category=category)
+        if not source:
+            return f"Error: [该分类] 没有可用的未使用语料文章。", None, None
 
-            title = source.get("title", "Untitled")
-            source_text = source.get("content", "")
-            
-            if not source_text.strip():
-                return f"Error: 语料 [{title}] 正文为空。", None, None
+        title = source.get("title", "Untitled")
+        source_text = source.get("content", "")
+        
+        if not source_text.strip():
+            return f"Error: 语料 [{title}] 正文为空。", None, None
 
         _log(f"\n[Engine] Starting Pipeline for [{category}/{level}]: {title}")
         import time
@@ -166,46 +210,100 @@ class ContentEngine:
                 raise InterruptedError("用户已手动停止任务")
 
             # ==========================================
-            # 第一步：智能选词 (Fast Model)
+            # 第一步：智能选词 (Fast Model) — 带重试补偿机制
             # ==========================================
-            _log(f"[1/3] 正在使用 [{self.fast_model}] 进行智能选词 (25-50词)...")
-            # 物理切除：最多只随机发送 100 个纯英文单词
             import random
-            candidate_words = [str(w.get("word", "")).strip() for w in words_data if str(w.get("word", "")).strip()]
-            if len(candidate_words) > 100:
-                candidate_words = random.sample(candidate_words, 100)
-            words_str = ", ".join(candidate_words)
-            
-            sys_1 = "你是一个词汇专家。"
-            usr_1 = (
-                f"请阅读提供的文章前奏片段，并从候选词库中挑选出 25 到 50 个最适合该语境的单词。\n"
-                f"【文章片段】：{source_text[:300]}...\n\n"
-                f"【候选词库】：\n{words_str}\n\n"
-                "请直接用英文逗号分隔输出你选中的单词（例如: apple, banana, car），绝对不要有任何其他废话、标点或解释！"
-            )
-            
-            words_str_output = self._call_llm(sys_1, usr_1, "Step 1", self.fast_model, check_stop_callback, stream=True, is_debug=True)
-            
-            # 容错提取（用正则找出所有英文单词）
-            selected_words_raw = re.findall(r'[a-zA-Z\'-]+', words_str_output)
-                
-            if not selected_words_raw or not isinstance(selected_words_raw, list):
-                raise ValueError("第一步未返回有效的单词列表。")
-                
-            selected_words_lower = [w.lower() for w in selected_words_raw]
-            
-            # 匹配词库详情
-            final_selected = []
-            for w in words_data:
-                if w.get("word", "").lower() in selected_words_lower:
-                    final_selected.append(w)
-                    
+            import string
+
+            MAX_RETRIES = 3
+            MIN_WORDS_TARGET = 25
+            final_selected: list[dict] = []
+
+            # 构建一个"原始词库"的快照，用于重试时重新抽取
+            original_words_data = words_data.copy()
+
+            for retry in range(MAX_RETRIES):
+                _log(f"[1/3] 正在使用 [{self.fast_model}] 进行智能选词 (尝试 {retry + 1}/{MAX_RETRIES})...")
+
+                # ── 1. 抽取候选词（排除已选中的单词） ──
+                excluded_words = {w.get("word", "").lower() for w in final_selected}
+                available_words = [
+                    w for w in original_words_data
+                    if str(w.get("word", "")).strip()
+                    and w.get("word", "").lower() not in excluded_words
+                ]
+
+                if len(available_words) < MIN_WORDS_TARGET:
+                    _log(f"   ⚠️ 剩余可用单词不足 {MIN_WORDS_TARGET} 个，停止重试。")
+                    break
+
+                candidate_words = [str(w.get("word", "")).strip() for w in available_words]
+                if len(candidate_words) > 100:
+                    candidate_words = random.sample(candidate_words, 100)
+                words_str = ", ".join(candidate_words)
+
+                sys_1 = "你是一个词汇专家。"
+                usr_1 = (
+                    f"请阅读提供的文章前奏片段，并从候选词库中挑选出 25 到 50 个最适合该语境的单词。\n"
+                    f"【文章片段】：{source_text[:300]}...\n\n"
+                    f"【候选词库】：\n{words_str}\n\n"
+                    "请直接用英文逗号分隔输出你选中的单词（例如: apple, banana, car），绝对不要有任何其他废话、标点或解释！"
+                )
+
+                words_str_output = self._call_llm(sys_1, usr_1, "Step 1", self.fast_model, check_stop_callback, stream=True, is_debug=True)
+
+                # ── 2. 容错提取 + 脏数据清理 ──
+                selected_words_raw = re.findall(r'[a-zA-Z\'-]+', words_str_output)
+
+                if not selected_words_raw or not isinstance(selected_words_raw, list):
+                    _log(f"   ⚠️ 第 {retry + 1} 轮未返回有效单词列表，继续重试...")
+                    continue
+
+                # 清理：strip + 去除首尾标点
+                selected_words_cleaned = []
+                for w in selected_words_raw:
+                    cleaned = w.strip().strip(string.punctuation).strip()
+                    if cleaned:
+                        selected_words_cleaned.append(cleaned)
+
+                selected_words_lower = [w.lower() for w in selected_words_cleaned]
+
+                # ── 3. 匹配词库详情 ──
+                matched_this_round = []
+                for w in available_words:
+                    if w.get("word", "").lower() in selected_words_lower:
+                        matched_this_round.append(w)
+
+                matched_this_round = matched_this_round[:50]
+                _log(f"   => 第 {retry + 1} 轮匹配成功 {len(matched_this_round)} 个单词。")
+
+                # ── 4. 追加到累加器并去重 ──
+                existing_words = {w.get("word", "").lower() for w in final_selected}
+                for w in matched_this_round:
+                    if w.get("word", "").lower() not in existing_words:
+                        final_selected.append(w)
+                        existing_words.add(w.get("word", "").lower())
+
+                _log(f"   => 累计选中 {len(final_selected)} 个单词。")
+
+                # ── 5. 检查是否达标 ──
+                if len(final_selected) >= MIN_WORDS_TARGET:
+                    _log(f"   ✅ 选词达标！共选中 {len(final_selected)} 个单词。")
+                    break
+
+                # 如果还有重试机会，继续下一轮
+                if retry < MAX_RETRIES - 1:
+                    _log(f"   🔄 单词不足 {MIN_WORDS_TARGET} 个，触发第 {retry + 2} 轮重试...")
+                else:
+                    _log(f"   ⚠️ 已达到最大重试次数，累计选中 {len(final_selected)} 个单词，继续执行。")
+
+            # 兜底：即使不足 25 个，只要有至少 5 个就继续；否则才报错
+            if len(final_selected) < 5:
+                raise ValueError(f"解析选词失败，累加后合法单词仅 {len(final_selected)} 个，过少。")
+
             final_selected = final_selected[:50]
-            if len(final_selected) < 10:
-                raise ValueError("解析选词失败，选出的合法单词过少。")
-                
             selected_words_str = ", ".join([w.get("word", "") for w in final_selected])
-            _log(f"   => 选词完成！共选中 {len(final_selected)} 个单词。")
+            _log(f"   => 最终选词完成！共选中 {len(final_selected)} 个单词。")
             
             if check_stop_callback and check_stop_callback():
                 raise InterruptedError("用户已手动停止任务")
@@ -234,26 +332,41 @@ class ContentEngine:
                 raise InterruptedError("用户已手动停止任务")
 
             # ==========================================
-            # 第三步：逐段精译与格式化 (Fast Model)
+            # 第三步：逐段精译与格式化 (Fast Model) — 带验证重试
             # ==========================================
-            _log(f"[3/3] 正在使用 [{self.fast_model}] 进行逐段翻译与排版...")
-            sys_3 = "你是一个英语教材翻译专家。"
+            MAX_TRANSLATION_RETRIES = 2
+            translated_article = ""
             
-            usr_3 = (
-                "请将我提供的这篇英文长文进行逐段翻译。\n\n"
-                "翻译排版要求（极其重要，必须严格遵守）：\n"
-                "1. 严格保持交替排版。\n"
-                "2. **格式必须是：一段英文原文 -> 空一行 -> 一段中文翻译 -> 空一行 -> 下一段英文原文...**\n"
-                "3. **绝对不要调换顺序！必须是先英文、后中文，绝对不能先中文后英文！**\n"
-                "4. 绝对不能把英文和中文黏在同一段里！\n"
-                "5. 绝对不要漏掉原文的任何一段，也不要自行合段！\n"
-                "6. 原文英文里加粗的生词（**word**），在翻译成中文时，**中文译文中绝对不要加粗**！请保持中文句子的正常、纯净排版。\n"
-                "7. 直接开始输出双语正文，绝对禁止输出标题、引言、总结或任何单独的词汇释义列表！\n\n"
-                f"【待翻译纯英文长文】：\n{english_article}\n"
-            )
-            
-            translated_article = self._call_llm(sys_3, usr_3, "Step 3", self.fast_model, check_stop_callback, stream=True, is_debug=True)
-            _log("   => 精译完成！")
+            for retry in range(MAX_TRANSLATION_RETRIES + 1):
+                _log(f"[3/3] 正在使用 [{self.fast_model}] 进行逐段翻译与排版... (尝试 {retry + 1}/{MAX_TRANSLATION_RETRIES + 1})")
+                
+                sys_3 = "你是一个英语教材翻译专家。"
+                
+                usr_3 = (
+                    "请将我提供的这篇英文长文进行逐段翻译。\n\n"
+                    "翻译排版要求（极其重要，必须严格遵守）：\n"
+                    "1. 严格保持交替排版。\n"
+                    "2. **格式必须是：一段英文原文 -> 空一行 -> 一段中文翻译 -> 空一行 -> 下一段英文原文...**\n"
+                    "3. **绝对不要调换顺序！必须是先英文、后中文，绝对不能先中文后英文！**\n"
+                    "4. 绝对不能把英文和中文黏在同一段里！\n"
+                    "5. 绝对不要漏掉原文的任何一段，也不要自行合段！\n"
+                    "6. 原文英文里加粗的生词（**word**），在翻译成中文时，**中文译文中绝对不要加粗**！请保持中文句子的正常、纯净排版。\n"
+                    "7. 直接开始输出双语正文，绝对禁止输出标题、引言、总结或任何单独的词汇释义列表！\n\n"
+                    f"【待翻译纯英文长文】：\n{english_article}\n"
+                )
+                
+                translated_article = self._call_llm(sys_3, usr_3, "Step 3", self.fast_model, check_stop_callback, stream=True, is_debug=True)
+                
+                # ── 验证翻译结果质量 ──────────────────────────
+                if self._validate_translation(translated_article, english_article):
+                    _log(f"   ✅ 翻译验证通过！")
+                    break
+                else:
+                    if retry < MAX_TRANSLATION_RETRIES:
+                        _log(f"   ⚠️ 翻译格式异常（缺少英文段落），触发第 {retry + 2} 次重试...")
+                    else:
+                        _log(f"   ❌ 翻译验证失败，已达到最大重试次数。")
+                        raise ValueError("翻译结果缺少英文段落，无法生成双语文章。")
             
             # Python 本地极速拼接最终 Markdown
             vocab_list_text = ""

@@ -1,9 +1,37 @@
+# Python virtual environments
 .venv/
 venv/
+
+# Python cache
 __pycache__/
-dist/
+*.pyc
+*.pyo
+
+# PyInstaller build artifacts
 build/
+dist/
 *.spec
+
+# Compiled binaries
 *.exe
+
+# User data & runtime databases
 *.db
+data/学习进度词库.db
+
+# User configuration (contains sensitive API keys)
 .api_config.json
+
+# User-generated archives (personal learning records)
+archives/
+used_articles.json
+
+# IDE & editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
