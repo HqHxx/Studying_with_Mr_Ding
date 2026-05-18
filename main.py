@@ -399,6 +399,15 @@ class App(ctk.CTk):
         )
         self.btn_reset_all.pack(side="left")
 
+        # ── 语料使用情况统计展现 ──
+        self._article_progress_label = ctk.CTkLabel(
+            self.reset_frame,
+            text="语料情况加载中...",
+            font=self.FONT_TEXT,
+            text_color=("gray40", "gray70"),
+        )
+        self._article_progress_label.pack(anchor="w", padx=14, pady=(0, 10))
+
         # ── 日志输出（先 pack，沉在最底） ──────────────────────
         self.log_textbox = ctk.CTkTextbox(
             tab,
@@ -424,6 +433,7 @@ class App(ctk.CTk):
         self.sash.bind("<Leave>", lambda e: self.sash.configure(fg_color="gray30"))
 
         self.log_message("就绪。请配置 API 参数后点击「开始生成」。", level="info")
+        self._refresh_article_progress_label()
 
     # ── Tab 2: 历史归档阅读 ───────────────────────────────────
     def _build_tab_archive(self) -> None:
@@ -679,15 +689,12 @@ class App(ctk.CTk):
                     self._log("⚠️ 生成篇数必须为正整数。", level="red")
                     return
 
-                import pathlib
-                LOCAL_CORPUS_PATH = pathlib.Path("local_corpus.json")
-                CUSTOM_CORPUS_PATH = pathlib.Path("custom_corpus.json")
-
                 if mode in ("builtin", "mixed") and not LOCAL_CORPUS_PATH.exists():
                     self._log("⚠️ 未找到 local_corpus.json，请先运行工具生成测试语料库。", level="red")
                     if mode == "builtin": return
 
-                if mode in ("custom", "mixed") and not CUSTOM_CORPUS_PATH.exists():
+                custom_db_path = BASE_DIR / "data" / "custom_corpus.json"
+                if mode in ("custom", "mixed") and not custom_db_path.exists():
                     self._log("⚠️ 未找到 custom_corpus.json，请先批量导入自定义语料。", level="red")
                     if mode == "custom": return
 
@@ -1303,6 +1310,44 @@ class App(ctk.CTk):
                 )
         except Exception:
             self._progress_label.configure(text="词库状态未知")
+        self._refresh_article_progress_label()
+
+    def _refresh_article_progress_label(self) -> None:
+        """刷新底部的文章语料使用情况统计。"""
+        if not hasattr(self, '_article_progress_label'):
+            return
+            
+        try:
+            from content_engine import load_corpus, load_used_articles
+            
+            # 使用 mixed 获取完整的总量和已使用情况，不随单选框过滤，更方便用户直观查看整体情况
+            all_articles = load_corpus(mode="mixed")
+            used_titles = load_used_articles()
+            
+            history_total = 0
+            history_used = 0
+            science_total = 0
+            science_used = 0
+            
+            for article in all_articles:
+                cat = article.get("category", "history")
+                title = article.get("title", "")
+                
+                if cat == "history":
+                    history_total += 1
+                    if title in used_titles:
+                        history_used += 1
+                elif cat == "science":
+                    science_total += 1
+                    if title in used_titles:
+                        science_used += 1
+                        
+            text = (f"📚 【语料库统计】  "
+                    f"历史 (History): 已用 {history_used} 篇 / 剩余 {history_total - history_used} 篇 / 总计 {history_total} 篇   |   "
+                    f"科学 (Science): 已用 {science_used} 篇 / 剩余 {science_total - science_used} 篇 / 总计 {science_total} 篇")
+            self._article_progress_label.configure(text=text)
+        except Exception as e:
+            self._article_progress_label.configure(text=f"📚 语料统计读取异常 (如果尚未导入任何语料属正常现象)")
 
 
 # ── 入口 ───────────────────────────────────────────────────────

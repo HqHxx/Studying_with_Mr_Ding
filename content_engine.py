@@ -64,6 +64,7 @@ class ContentEngine:
         self.llm_client = OpenAI(base_url=base_url, api_key=api_key)
         self.corpus = load_corpus(mode=corpus_mode)
         self._used_titles: set[str] = load_used_articles()
+        self._last_validation_reason = ""
 
     def pick_source_article(self, category: str | None = None) -> dict | None:
         available = [
@@ -81,9 +82,9 @@ class ContentEngine:
     def _call_llm(self, system_prompt: str, user_prompt: str, step_name: str, target_model: str, check_stop_callback=None, stream=False, is_debug=False) -> str:
         messages = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
+            {"role": "user", "content": user_prompt}
         ]
-        
+            
         if is_debug:
             import time
             prompt_content = system_prompt + "\n" + user_prompt
@@ -91,15 +92,20 @@ class ContentEngine:
             start_time = time.time()
         
         full_content = ""
+        # 随机生成一个切断阈值，让截断点在 40 到 50 之间浮动
+        max_cut_words = random.randint(40, 50) if step_name == "Step 1" else float('inf')
         for continuation_step in range(3):
             if check_stop_callback and check_stop_callback():
                 raise InterruptedError("用户已手动停止任务")
 
+            step_temp = 0.7
+            step_max_tokens = 4096
+
             response = self.llm_client.chat.completions.create(
                 model=target_model,
                 messages=messages,
-                temperature=0.7,
-                max_tokens=4096,
+                temperature=step_temp,
+                max_tokens=step_max_tokens,
                 timeout=150.0,
                 stream=stream
             )
@@ -108,13 +114,14 @@ class ContentEngine:
             finish_reason = "stop"
             if stream:
                 print(f"---> [Debug] {step_name} 开始流式输出: \n", end="", flush=True)
+                # 使用一个标志位记录是否进入了有效输出区域
+                output_started = False
                 for chunk_obj in response:
                     if check_stop_callback and check_stop_callback():
                         raise InterruptedError("用户已手动停止任务")
                     if chunk_obj.choices and len(chunk_obj.choices) > 0:
                         delta = chunk_obj.choices[0].delta
                         if delta:
-                            # 兼容深度思考大模型 (如 DeepSeek-R1) 的内部思维链透出
                             reasoning = getattr(delta, 'reasoning_content', None)
                             if reasoning:
                                 print(f"\033[90m{reasoning}\033[0m", end="", flush=True)
@@ -123,6 +130,18 @@ class ContentEngine:
                                 text = delta.content
                                 print(text, end="", flush=True)
                                 chunk += text
+                        
+                        # 物理熔断逻辑（应对大模型长篇大论的废话，只处理不在推理区块输出的情况）
+                        # 我们统计纯输出中的字母+逗号的模式。由于大模型有时会附带 (not there), 或者序号，我们做更宽松的切割判断。
+                        # 这里我们只统计当前正文（不算 reasoning），判断是否输出了足够多的单词。
+                        word_count = len(re.findall(r'[a-zA-Z\'-]+', full_content + chunk))
+                        if step_name == "Step 1" and word_count >= max_cut_words * 2: # 放宽两倍因为废话里也有字母
+                            print(f"\n\n---> [Debug] 达到熔断保护阈值，物理熔断强制极速切断流。")
+                            finish_reason = "stop"
+                            if hasattr(response, 'close'):
+                                response.close()
+                            break
+                            
                         if chunk_obj.choices[0].finish_reason:
                             finish_reason = chunk_obj.choices[0].finish_reason
                 print("\n---> [Debug] 流式输出结束。")
@@ -142,9 +161,15 @@ class ContentEngine:
             if finish_reason == "length" or (step_name != "Step 1" and not is_complete):
                 print(f"[Engine] {step_name} - Output truncated at step {continuation_step + 1}. Requesting continuation...")
                 messages.append({"role": "assistant", "content": chunk})
+                
+                if step_name == "Step 1":
+                    continuation_prompt = "请继续提取未写完的英文单词。请严格保持仅用逗号分隔的格式，最多补充到满足总量即可，千万不要说任何废话，也不要重复之前已经输出过的词。"
+                else:
+                    continuation_prompt = "请紧接着你刚才中断的地方继续输出，不要重复已经写过的内容，不要说多余的废话，直接接上正文。"
+                    
                 messages.append({
                     "role": "user", 
-                    "content": "请紧接着你刚才中断的地方继续输出，不要重复已经写过的内容，不要说多余的废话，直接接上正文。"
+                    "content": continuation_prompt
                 })
             else:
                 break
@@ -156,33 +181,35 @@ class ContentEngine:
         return full_content
 
     def _validate_translation(self, translated: str, original: str) -> bool:
-        """验证翻译结果是否包含足够的英文段落。
+        """验证纯中文翻译的结果质量。
         
         检查逻辑：
         1. 翻译结果不能为空
-        2. 必须包含英文单词（ASCII字母）
-        3. 英文段落数量应不少于原文段落数量的 50%
+        2. 中文段落数不能严重少于英文段落数
         """
+        self._last_validation_reason = ""
+
         if not translated or not translated.strip():
+            self._last_validation_reason = "翻译结果为空"
             return False
-        
-        # 检查是否包含英文单词（至少有一些ASCII字母）
-        english_words = re.findall(r'[a-zA-Z]{3,}', translated)
-        if len(english_words) < 10:
-            return False
-        
-        # 统计原文段落数（按空行分割）
+            
         original_paragraphs = [p.strip() for p in original.split('\n\n') if p.strip()]
-        # 统计翻译结果中的英文段落数（包含至少3个英文单词的段落）
         translated_paragraphs = [p.strip() for p in translated.split('\n\n') if p.strip()]
-        english_paragraphs = [
-            p for p in translated_paragraphs 
-            if len(re.findall(r'[a-zA-Z]{3,}', p)) >= 3
-        ]
         
-        # 英文段落数应不少于原文段落数的 30%（允许一些合并/分割差异）
-        min_required = max(2, len(original_paragraphs) * 0.3)
-        return len(english_paragraphs) >= min_required
+        if len(translated_paragraphs) < len(original_paragraphs) * 0.7:
+            self._last_validation_reason = (
+                f"中文段落严重缺失: {len(translated_paragraphs)}/{len(original_paragraphs)} "
+            )
+            return False
+            
+        for idx, p in enumerate(translated_paragraphs, start=1):
+            if re.search(r'[a-zA-Z]{5,}', p) and len(re.findall(r'[a-zA-Z]{3,}', p)) >= 5:
+                # 依然警惕大段英文出现（纯中文里不该出现太长连续英文）
+                if not re.search(r'[\u4e00-\u9fff]', p):
+                    snippet = p.replace("\n", " ")[:80]
+                    self._last_validation_reason = f"检测到未翻译的英文段: 第{idx}段, 内容片段: {snippet}"
+                    return False
+        return True
 
     def generate_article(self, words_data: list[dict], category: str = "history", level: str = "CET-4", log_callback=None, check_stop_callback=None):
         def _log(msg: str):
@@ -216,7 +243,7 @@ class ContentEngine:
             import string
 
             MAX_RETRIES = 3
-            MIN_WORDS_TARGET = 25
+            MIN_WORDS_TARGET = 35
             final_selected: list[dict] = []
 
             # 构建一个"原始词库"的快照，用于重试时重新抽取
@@ -238,21 +265,24 @@ class ContentEngine:
                     break
 
                 candidate_words = [str(w.get("word", "")).strip() for w in available_words]
-                if len(candidate_words) > 100:
-                    candidate_words = random.sample(candidate_words, 100)
+                if len(candidate_words) > 120:
+                    candidate_words = random.sample(candidate_words, 120)
                 words_str = ", ".join(candidate_words)
 
-                sys_1 = "你是一个词汇专家。"
+                sys_1 = "你是一个词汇专家。你的任务是挑选合适的单词集合。"
                 usr_1 = (
-                    f"请阅读提供的文章前奏片段，并从候选词库中挑选出 25 到 50 个最适合该语境的单词。\n"
+                    f"请阅读提供的文章前奏片段，并从候选词库中挑选出 35 到 50 个单词。\n"
+                    f"【挑选准则极大放宽】：无需与文章当前片段强相关！只要你觉得这些词在后续的长文扩写中“沾点关系”、“有可能用上”，就果断选出来！保证最终植入时稍微自然即可。\n"
+                    f"【重要指示】：请充分利用词库，尽可能多地挑选单词，绝对要向 50 个的上限靠拢！\n"
                     f"【文章片段】：{source_text[:300]}...\n\n"
                     f"【候选词库】：\n{words_str}\n\n"
-                    "请直接用英文逗号分隔输出你选中的单词（例如: apple, banana, car），绝对不要有任何其他废话、标点或解释！"
+                    "请直接且仅仅输出你选中的单词，用英文逗号分隔（例如: apple, banana, car），不要输出任何思考过程，绝对不要给每个词都写上 (not there) 或者加上序号！输出达到 50 个时务必停止！"
                 )
 
                 words_str_output = self._call_llm(sys_1, usr_1, "Step 1", self.fast_model, check_stop_callback, stream=True, is_debug=True)
 
                 # ── 2. 容错提取 + 脏数据清理 ──
+                # 兼容大模型啰嗦思考，我们直接正则提取所有英文组合
                 selected_words_raw = re.findall(r'[a-zA-Z\'-]+', words_str_output)
 
                 if not selected_words_raw or not isinstance(selected_words_raw, list):
@@ -297,7 +327,7 @@ class ContentEngine:
                 else:
                     _log(f"   ⚠️ 已达到最大重试次数，累计选中 {len(final_selected)} 个单词，继续执行。")
 
-            # 兜底：即使不足 25 个，只要有至少 5 个就继续；否则才报错
+            # 兜底：即使不足 30 个，只要有至少 5 个就继续；否则才报错
             if len(final_selected) < 5:
                 raise ValueError(f"解析选词失败，累加后合法单词仅 {len(final_selected)} 个，过少。")
 
@@ -312,21 +342,87 @@ class ContentEngine:
             # 第二步：英文重写与植入 (Core Model)
             # ==========================================
             _log(f"[2/3] 正在使用 [{self.core_model}] 进行深度重写与植入... (这步耗时较长，请耐心等待)")
-            sys_2 = "你现在是一位英语为母语的顶尖专栏作家（如《经济学人》或《国家地理》的资深编辑）。"
+            sys_2 = "你现在是一位英语为母语的顶尖专栏作家。"
             usr_2 = (
                 f"请根据我提供的原文章，重写并扩写出一篇 600-800 词的高质量英文长文。\n\n"
                 f"【原文标题】：{title}\n"
                 f"【原文内容（全文）】：\n{source_text}\n\n"
                 f"【目标单词池】（共 {len(final_selected)} 个）：\n{selected_words_str}\n\n"
                 "【核心写作约束】\n"
-                "1. 绝对地道 (Authenticity)：彻底摒弃中式英语 (Chinglish) 和 AI 生成的机器味。请使用英语母语者常用的地道搭配 (Collocations)、短语动词 (Phrasal verbs) 和恰当的习语 (Idioms)。\n"
-                "2. 句式丰富 (Syntactic Variety)：不要全是简单的主谓宾结构。请巧妙地交替使用长短句、从句、分词伴随状语、倒装句等高级句式，让文章充满节奏感和文学张力。\n"
-                "3. 无痕植入 (Seamless Integration)：将我提供的目标单词列表极其自然地融进文章中并用 ** 加粗。这些生词的出现必须完全符合逻辑流和语境，仿佛它们天生就长在这篇文章里，绝不能有为了凑词而强行生搬硬套的割裂感。\n"
-                "4. 纯英文输出：只输出排版精美的 Markdown 纯英文正文，不要有任何解释性废话。"
+                "1. 绝对地道 (Authenticity)：彻底摒弃中式英语 (Chinglish) 和 AI 生成的机器味。\n"
+                "2. 句式丰富 (Syntactic Variety)：巧妙交替使用长短句、从句等高级句式。\n"
+                "3. 无痕植入与加粗：将我提供的【目标单词池】中的词融合进文章，并将它们（或它们的变形）进行 **加粗**。\n"
+                "4. 纯英文输出（致命红线）：文章必须是 100% 纯英文。绝对禁止在英文中夹杂任何汉字（如拼出 'central权威' 这样的畸形句子）！如果原文中有难翻的词，必须用英文意译，只要输出哪怕一个汉字也就是彻底失败！不要有任何解释性中文废话。"
             )
             
             english_article = self._call_llm(sys_2, usr_2, "Step 2", self.core_model, check_stop_callback, stream=True, is_debug=True)
-            _log("   => 英文长文重写完成！")
+
+            # Step 2 兜底净化：若模型夹带汉字，先物理清理，避免污染传入 Step 3
+            if re.search(r'[\u4e00-\u9fff]', english_article):
+                _log("   ⚠️ Step 2 检测到中文污染，正在执行英文净化...")
+                english_article = re.sub(r'[\u4e00-\u9fff]+', '', english_article)
+                english_article = re.sub(r'[，。！？；：“”‘’（）【】《》、]', ' ', english_article)
+                english_article = re.sub(r'\s{2,}', ' ', english_article)
+            
+            # --- 终极 Python 物理清洗：修复模型发疯式的全局乱加粗 ---
+            # 1. 修复前后切段的加粗
+            english_article = re.sub(r'\*\*([a-zA-Z\'-]+)\*\*([a-zA-Z\'-]+)', r'**\1\2**', english_article)
+            english_article = re.sub(r'([a-zA-Z\'-]+)\*\*([a-zA-Z\'-]+)\*\*', r'**\1\2**', english_article)
+            english_article = re.sub(r'\*\*([a-zA-Z\'-]+)\*\*\s+([\'’]s)', r'**\1\2**', english_article)
+            
+            # 2. 剥夺非法单词的加粗特权！
+            target_words_lower = [w.get("word", "").lower() for w in final_selected]
+            
+            def filter_illegal_bolding(match):
+                marked_text = match.group(1)
+                
+                # 防多词串联乱加粗 (如高亮了完整的一个短语: **a theory he**)
+                word_tokens = re.findall(r'[a-zA-Z]+', marked_text)
+                if len(word_tokens) >= 3:
+                    return marked_text # 直接剥夺加粗
+                    
+                marked_clean = re.sub(r'[^a-zA-Z]', '', marked_text).lower()
+                is_legal = False
+                
+                for tw in target_words_lower:
+                    tw_clean = re.sub(r'[^a-zA-Z]', '', tw).lower()
+                    if not tw_clean: continue
+                    
+                    if marked_clean == tw_clean:
+                        is_legal = True
+                        break
+                        
+                    # 计算公共前缀
+                    prefix_len = 0
+                    for c1, c2 in zip(marked_clean, tw_clean):
+                        if c1 == c2: prefix_len += 1
+                        else: break
+                        
+                    # 极度严苛的词干限制，防止 "the" 匹配 "them/theory", "for" 匹配 "forsaken"
+                    if len(tw_clean) <= 3:
+                        # 短词必须完全相等，最多加简单后缀
+                        allowed = [tw_clean, tw_clean+'s', tw_clean+'es', tw_clean+'d', tw_clean+'ed', tw_clean+'ing', tw_clean+'y', tw_clean+'ly',
+                                   tw_clean+tw_clean[-1]+'ed', tw_clean+tw_clean[-1]+'ing',
+                                   tw_clean[:-1]+'ing', tw_clean[:-1]+'es']
+                        if marked_clean in allowed:
+                            is_legal = True
+                            break
+                    elif len(tw_clean) <= 5:
+                        if prefix_len >= len(tw_clean) - 1 and abs(len(marked_clean) - len(tw_clean)) <= 4:
+                            is_legal = True
+                            break
+                    else:
+                        if prefix_len >= 4 and prefix_len >= len(tw_clean) - 3 and abs(len(marked_clean) - len(tw_clean)) <= 5:
+                            is_legal = True
+                            break
+                            
+                return f"**{marked_text}**" if is_legal else marked_text
+                
+            english_article = re.sub(r'\*\*(.*?)\*\*', filter_illegal_bolding, english_article)
+            
+            _log("   => 英文长文重写与格式自动修复完成！")
+            
+            _log("   => 英文长文重写与格式自动修复完成！")
             
             if check_stop_callback and check_stop_callback():
                 raise InterruptedError("用户已手动停止任务")
@@ -338,42 +434,53 @@ class ContentEngine:
             translated_article = ""
             
             for retry in range(MAX_TRANSLATION_RETRIES + 1):
-                _log(f"[3/3] 正在使用 [{self.fast_model}] 进行逐段翻译与排版... (尝试 {retry + 1}/{MAX_TRANSLATION_RETRIES + 1})")
+                _log(f"[3/3] 正在使用 [{self.core_model}] 进行逐段翻译与排版... (尝试 {retry + 1}/{MAX_TRANSLATION_RETRIES + 1})")
                 
                 sys_3 = "你是一个英语教材翻译专家。"
                 
                 usr_3 = (
-                    "请将我提供的这篇英文长文进行逐段翻译。\n\n"
-                    "翻译排版要求（极其重要，必须严格遵守）：\n"
-                    "1. 严格保持交替排版。\n"
-                    "2. **格式必须是：一段英文原文 -> 空一行 -> 一段中文翻译 -> 空一行 -> 下一段英文原文...**\n"
-                    "3. **绝对不要调换顺序！必须是先英文、后中文，绝对不能先中文后英文！**\n"
-                    "4. 绝对不能把英文和中文黏在同一段里！\n"
-                    "5. 绝对不要漏掉原文的任何一段，也不要自行合段！\n"
-                    "6. 原文英文里加粗的生词（**word**），在翻译成中文时，**中文译文中绝对不要加粗**！请保持中文句子的正常、纯净排版。\n"
-                    "7. 直接开始输出双语正文，绝对禁止输出标题、引言、总结或任何单独的词汇释义列表！\n\n"
+                    "请将我提供的这篇英文长文逐段翻译成中文。\n\n"
+                    "【翻译要求】（极其重要，必须严格遵守）：\n"
+                    "1. **只允许输出中文翻译！绝对不要复制或输出任何英文原文！**\n"
+                    "2. **格式必须是纯中文段落！** 一段中文，空一行，下一段中文。\n"
+                    "3. 必须精准对应。原文有几段，你就输出几段中文翻译！不要自行合并或拆分！\n"
+                    "4. 原文英文里加粗的生词（**word**），在翻译成中文时，**中文译文中绝对不要加粗**！请保持中文句子的正常、纯净排版。\n"
+                    "5. 直接开始输出中文翻译正文，绝对禁止输出标题、引言、总结或任何单独的词汇释义列表！\n\n"
                     f"【待翻译纯英文长文】：\n{english_article}\n"
                 )
                 
-                translated_article = self._call_llm(sys_3, usr_3, "Step 3", self.fast_model, check_stop_callback, stream=True, is_debug=True)
+                translated_article = self._call_llm(sys_3, usr_3, "Step 3", self.core_model, check_stop_callback, stream=True, is_debug=True)
                 
                 # ── 验证翻译结果质量 ──────────────────────────
                 if self._validate_translation(translated_article, english_article):
                     _log(f"   ✅ 翻译验证通过！")
+                    
+                    # 💡 【核心修改】：通过 Python 进行物理级绝对安全的中英交替拼装！彻底消灭模型拼接引发的幻觉！
+                    eng_paras = [p.strip() for p in english_article.split('\n\n') if p.strip()]
+                    zh_paras = [p.strip() for p in translated_article.split('\n\n') if p.strip()]
+                    
+                    bilingual_pairs = []
+                    for i in range(max(len(eng_paras), len(zh_paras))):
+                        if i < len(eng_paras): bilingual_pairs.append(eng_paras[i])
+                        if i < len(zh_paras): bilingual_pairs.append(zh_paras[i])
+                        
+                    final_bilingual_text = '\n\n'.join(bilingual_pairs)
                     break
                 else:
+                    fail_reason = self._last_validation_reason or "未知校验失败"
                     if retry < MAX_TRANSLATION_RETRIES:
-                        _log(f"   ⚠️ 翻译格式异常（缺少英文段落），触发第 {retry + 2} 次重试...")
+                        _log(f"   ⚠️ 翻译校验失败：{fail_reason}")
+                        _log(f"   ↪ 触发第 {retry + 2} 次重试...")
                     else:
-                        _log(f"   ❌ 翻译验证失败，已达到最大重试次数。")
-                        raise ValueError("翻译结果缺少英文段落，无法生成双语文章。")
+                        _log(f"   ❌ 翻译验证失败，已达到最大重试次数。原因：{fail_reason}")
+                        raise ValueError(f"翻译校验失败：{fail_reason}")
             
             # Python 本地极速拼接最终 Markdown
             vocab_list_text = ""
             for w in final_selected:
                 vocab_list_text += f"- **{w.get('word', '')}** {w.get('phonetic', '')} {w.get('definition', '')}\n"
                 
-            final_article = f"# {title}\n\n### 核心词汇\n\n{vocab_list_text}\n\n### 双语正文\n\n{translated_article}"
+            final_article = f"# {title}\n\n### 核心词汇\n\n{vocab_list_text}\n\n### 双语正文\n\n{final_bilingual_text}"
             
             used_words = [w.get("word", "").lower() for w in final_selected]
             return final_article, used_words, title
